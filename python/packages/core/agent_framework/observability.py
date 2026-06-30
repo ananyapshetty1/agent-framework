@@ -513,9 +513,23 @@ def _install_process_metrics_processor_on_global_provider() -> None:
                     capture.stamp()
                 return original_end(end_time)
 
-            span.end = _wrapped_end  # type: ignore[method-assign]
+            try:
+                span.end = _wrapped_end  # type: ignore[method-assign]
+            except Exception:
+                captures = getattr(self, "_captures", None)
+                if captures is None:
+                    captures = {}
+                    setattr(self, "_captures", captures)
+                captures[id(span)] = capture
 
-        def on_end(self, span: Any) -> None: ...
+        def on_end(self, span: Any) -> None:
+            captures = getattr(self, "_captures", None)
+            if not captures:
+                return
+            capture = captures.pop(id(span), None)
+            if capture is not None:
+                with contextlib.suppress(Exception):
+                    capture.stamp()
 
         def shutdown(self) -> None: ...
 
