@@ -124,6 +124,7 @@ variable.
 | `agent-framework-core` | `observability` | `ENABLE_INSTRUMENTATION` | `true` |
 | `agent-framework-core` | `observability` | `ENABLE_SENSITIVE_DATA` | `false` |
 | `agent-framework-core` | `observability` | `ENABLE_CONSOLE_EXPORTERS` | `true` |
+| `agent-framework-core` | `observability` | `ENABLE_PROCESS_METRICS` | `false` |
 | `agent-framework-core` | `agent_framework._telemetry` | `AGENT_FRAMEWORK_FEATURE_MASK_DISABLED` | `true` |
 | `agent-framework-core` | `agent_framework._telemetry` | `AGENT_FRAMEWORK_USER_AGENT_DISABLED` | `true` |
 | `agent-framework-core` | `observability` | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` |
