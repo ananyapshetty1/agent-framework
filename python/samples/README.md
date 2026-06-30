@@ -120,6 +120,7 @@ variable.
 | `agent-framework-core` | `observability` | `ENABLE_INSTRUMENTATION` | `true` |
 | `agent-framework-core` | `observability` | `ENABLE_SENSITIVE_DATA` | `false` |
 | `agent-framework-core` | `observability` | `ENABLE_CONSOLE_EXPORTERS` | `true` |
+| `agent-framework-core` | `observability` | `ENABLE_PROCESS_METRICS` | `false` |
 | `agent-framework-core` | `observability` | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` |
 | `agent-framework-core` | `observability` | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://localhost:4318/v1/traces` |
 | `agent-framework-core` | `observability` | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | `http://localhost:4318/v1/metrics` |
