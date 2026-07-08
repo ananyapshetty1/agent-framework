@@ -755,6 +755,8 @@ class FunctionTool(SerializationMixin):
             # Snapshot the per-span baseline immediately so the stamp at the end
             # of this function reflects exactly this tool span's lifetime.
             process_metrics = start_process_metrics_capture(span)
+            if process_metrics.is_armed():
+                logger.debug(f"Process metrics profiling armed for function {self.name}.")
             attributes[OtelAttr.MEASUREMENT_FUNCTION_TAG_NAME] = self.name
             logger.info(f"Function name: {self.name}")
             if OBSERVABILITY_SETTINGS.SENSITIVE_DATA_ENABLED:
