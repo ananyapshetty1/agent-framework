@@ -391,8 +391,9 @@ class _ProcessMetricsCapture:
         self._start_system: float = 0.0
         self._armed: bool = False
         if psutil is None:
+            logger.debug("Process metrics capture disabled: psutil is not installed.")
             return
-        with contextlib.suppress(Exception):
+        try:
             self._process = psutil.Process()
             self._ncpu = max(int(psutil.cpu_count(logical=True) or 1), 1)
             times = self._process.cpu_times()
@@ -400,6 +401,8 @@ class _ProcessMetricsCapture:
             self._start_system = float(times.system)
             self._start_t = time.monotonic()
             self._armed = True
+        except Exception as exc:
+            logger.debug("Process metrics capture failed to snapshot baseline: %s", exc)
 
     def is_armed(self) -> bool:
         """Return ``True`` iff the capture successfully snapshotted a baseline."""
@@ -409,7 +412,7 @@ class _ProcessMetricsCapture:
         """Stamp process CPU (user/system) and memory attributes on the bound span."""
         if not self._armed or self._span is None or self._process is None:
             return
-        with contextlib.suppress(Exception):
+        try:
             elapsed = max(time.monotonic() - self._start_t, 1e-6)
             times = self._process.cpu_times()
             user_delta = max(float(times.user) - self._start_user, 0.0)
@@ -417,8 +420,12 @@ class _ProcessMetricsCapture:
             denom = elapsed * self._ncpu
             self._span.set_attribute(OtelAttr.PROCESS_CPU_UTILIZATION_USER, user_delta / denom)
             self._span.set_attribute(OtelAttr.PROCESS_CPU_UTILIZATION_SYSTEM, system_delta / denom)
-        with contextlib.suppress(Exception):
+        except Exception as exc:
+            logger.debug("Process metrics capture failed to stamp CPU utilization: %s", exc)
+        try:
             self._span.set_attribute(OtelAttr.PROCESS_MEMORY_USAGE, int(self._process.memory_info().rss))
+        except Exception as exc:
+            logger.debug("Process metrics capture failed to stamp memory usage: %s", exc)
 
 
 class _NoopProcessMetricsCapture:
@@ -477,13 +484,16 @@ def _install_process_metrics_processor_on_global_provider() -> None:
     try:
         from opentelemetry.sdk.trace import SpanProcessor
     except ModuleNotFoundError:
+        logger.debug("Process metrics processor not installed: opentelemetry-sdk is not available.")
         return
     if psutil is None:
+        logger.debug("Process metrics processor not installed: psutil is not installed.")
         return
 
     provider = trace.get_tracer_provider()
     add_processor = getattr(provider, "add_span_processor", None)
     if add_processor is None:
+        logger.debug("Process metrics processor not installed: TracerProvider has no add_span_processor.")
         return
     if getattr(provider, _PROCESS_METRICS_INSTALLED_FLAG, False):
         return
@@ -504,13 +514,17 @@ def _install_process_metrics_processor_on_global_provider() -> None:
             # (in `_get_span`, the streaming-span helper and `_tools.py`) that
             # this span is already being tracked, so they skip and avoid a
             # second baseline+stamp on the same span.
-            with contextlib.suppress(Exception):
+            try:
                 setattr(span, _PROCESS_METRICS_ARMED_MARKER, True)
+            except Exception as exc:
+                logger.debug("Process metrics processor could not mark span as armed: %s", exc)
             original_end = span.end
 
             def _wrapped_end(end_time: Any = None) -> Any:
-                with contextlib.suppress(Exception):
+                try:
                     capture.stamp()
+                except Exception as exc:
+                    logger.debug("Process metrics processor failed to stamp span on end: %s", exc)
                 return original_end(end_time)
 
             try:
@@ -538,6 +552,7 @@ def _install_process_metrics_processor_on_global_provider() -> None:
 
     add_processor(_ProcessMetricsSpanProcessor())
     setattr(provider, _PROCESS_METRICS_INSTALLED_FLAG, True)
+    logger.debug("Process metrics SpanProcessor installed on global TracerProvider.")
 
 
 def _patch_set_tracer_provider_for_process_metrics() -> None:
@@ -579,10 +594,12 @@ def enable_process_metrics() -> None:
     """
     global _process_metrics_enabled
     if psutil is None:
+        logger.debug("enable_process_metrics() is a no-op: psutil is not installed.")
         return
     _process_metrics_enabled = True
     _install_process_metrics_processor_on_global_provider()
     _patch_set_tracer_provider_for_process_metrics()
+    logger.debug("Process metrics enabled: CPU/memory attributes will be stamped on invoke_agent/execute_tool spans.")
 
 
 # Parse headers helper
