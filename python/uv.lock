@@ -452,6 +452,9 @@ all = [
     { name = "agent-framework-tools" },
     { name = "mcp", extra = ["ws"] },
 ]
+profiling = [
+    { name = "psutil" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -493,11 +496,12 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'all'", specifier = ">=1.24.0,<2" },
     { name = "msgspec", specifier = ">=0.20.0,<0.22" },
     { name = "opentelemetry-api", specifier = ">=1.39.0,<2" },
+    { name = "psutil", marker = "extra == 'profiling'", specifier = ">=5.9" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "python-dotenv", specifier = ">=1,<2" },
     { name = "typing-extensions", specifier = ">=4.15.0,<5" },
 ]
-provides-extras = ["all"]
+provides-extras = ["profiling", "all"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "azure-ai-agentserver-core", specifier = ">=2.0.0b7,<3" }]
