@@ -44,7 +44,7 @@ jobs:
           github-app-client-id: ${{ secrets.GH_APP_CLIENT_ID }}
           github-app-installation-id: ${{ secrets.GH_APP_INSTALLATION_ID }}
           repository: ${{ github.repository }}
-          fallback-token: ${{ secrets.GH_ACTIONS_PR_WRITE }}
+          fallback-token: ${{ secrets.GH_ACTIONS_PR_WRITE || github.token }}
 
       - uses: actions/labeler@f27b608878404679385c85cfa523b85ccb86e213 # v6
         with:

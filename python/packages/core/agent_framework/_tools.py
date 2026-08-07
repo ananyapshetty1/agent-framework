@@ -51,6 +51,7 @@ from .observability import (
     get_function_span,
     get_function_span_attributes,
     get_meter,
+    start_process_metrics_capture,
 )
 
 if sys.version_info >= (3, 13):
@@ -751,6 +752,11 @@ class FunctionTool(SerializationMixin):
                 )
             })
         with get_function_span(attributes=attributes) as span:
+            # Snapshot the per-span baseline immediately so the stamp at the end
+            # of this function reflects exactly this tool span's lifetime.
+            process_metrics = start_process_metrics_capture(span)
+            if process_metrics.is_armed():
+                logger.debug(f"Process metrics profiling armed for function {self.name}.")
             attributes[OtelAttr.MEASUREMENT_FUNCTION_TAG_NAME] = self.name
             logger.info(f"Function name: {self.name}")
             if OBSERVABILITY_SETTINGS.SENSITIVE_DATA_ENABLED:
@@ -790,6 +796,7 @@ class FunctionTool(SerializationMixin):
             finally:
                 duration = (end_time_stamp or perf_counter()) - start_time_stamp
                 span.set_attribute(OtelAttr.MEASUREMENT_FUNCTION_INVOCATION_DURATION, duration)
+                process_metrics.stamp()
                 self._invocation_duration_histogram.record(duration, attributes=attributes)
                 logger.info("Function duration: %fs", duration)
 

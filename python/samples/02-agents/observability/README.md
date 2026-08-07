@@ -188,6 +188,36 @@ Exporters are **not** installed by default — install only what you need:
 - **Aspire Dashboard or other OTLP/gRPC backends**: `opentelemetry-exporter-otlp-proto-grpc`
 - **OTLP over HTTP**: `opentelemetry-exporter-otlp-proto-http`
 
+### Process telemetry attributes (traces)
+
+When enabled, the framework stamps these process-level attributes onto every
+`invoke_agent` and `execute_tool` span:
+
+- `process.cpu.utilization.user` — user-mode CPU fraction during the span (0.0 – 1.0).
+- `process.cpu.utilization.system` — kernel-mode CPU fraction during the span (0.0 – 1.0).
+- `process.memory.usage` — process RSS in bytes at span end.
+
+**Disabled by default.** Opt in by setting `ENABLE_PROCESS_METRICS=true` in your
+environment; `configure_otel_providers()` reads it and enables the feature
+automatically — including when tracing is owned by an external integration such
+as `azure-monitor-opentelemetry`. Requires the optional `psutil`
+package — install with `pip install agent-framework-core[profiling]`.
+
+Application Insights query example:
+
+```kusto
+union traces, requests, dependencies
+| where operation_Id == "<trace-id>"
+| project timestamp, name,
+    cpu_user   = toreal(customDimensions["process.cpu.utilization.user"]),
+    cpu_system = toreal(customDimensions["process.cpu.utilization.system"]),
+    memory_usage_bytes = tolong(customDimensions["process.memory.usage"])
+| order by timestamp asc
+```
+
+> The values are process-wide. Concurrent agent/tool spans share CPU and RSS,
+> so per-span attribution is approximate when work runs in parallel.
+
 For other backends, refer to the documentation of the specific exporter.
 
 ### Environment variables
@@ -199,6 +229,7 @@ Agent Framework reads the following environment variables:
 | `ENABLE_INSTRUMENTATION` | `true` | Set to `false` to disable native instrumentation. See [Disabling instrumentation](#disabling-instrumentation) for the programmatic alternative with sticky semantics. |
 | `ENABLE_SENSITIVE_DATA` | `false` | Set to `true` to emit sensitive data (prompts, responses, etc.). |
 | `ENABLE_CONSOLE_EXPORTERS` | `false` | Set to `true` to add console exporters. Only used by `configure_otel_providers()`. |
+| `ENABLE_PROCESS_METRICS` | `false` | Set to `true` to stamp `process.cpu.utilization.{user,system}` and `process.memory.usage` on `invoke_agent` and `execute_tool` spans. Requires the optional `psutil` package. |
 | `VS_CODE_EXTENSION_PORT` | unset | Port used by the [AI Toolkit for VS Code](https://marketplace.visualstudio.com/items?itemName=ms-windows-ai-studio.windows-ai-studio#tracing) tracing integration. Only used by `configure_otel_providers()`. |
 
 You can also call `enable_sensitive_telemetry()` from `agent_framework.observability` to opt in to sensitive-data capture programmatically.

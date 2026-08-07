@@ -6,6 +6,8 @@ Commonly used exports:
 - enable_instrumentation
 - disable_instrumentation
 - enable_sensitive_telemetry
+- enable_process_metrics
+- start_process_metrics_capture
 - configure_otel_providers
 - AgentTelemetryLayer
 - ChatTelemetryLayer
@@ -21,6 +23,7 @@ import json
 import logging
 import os
 import sys
+import time
 import weakref
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from enum import Enum
@@ -40,6 +43,11 @@ from typing import (
 from dotenv import load_dotenv
 from opentelemetry import metrics, trace
 from typing_extensions import Sentinel
+
+try:
+    import psutil  # type: ignore[reportMissingImports]
+except ModuleNotFoundError:  # pragma: no cover
+    psutil = None  # type: ignore[assignment]
 
 from . import __version__ as version_info
 from ._serialization import (
@@ -100,10 +108,12 @@ __all__ = [
     "create_resource",
     "disable_instrumentation",
     "enable_instrumentation",
+    "enable_process_metrics",
     "enable_sensitive_telemetry",
     "get_meter",
     "get_tracer",
     "set_mcp_span_error",
+    "start_process_metrics_capture",
 ]
 
 
@@ -346,6 +356,9 @@ class OtelAttr(str, Enum):
     MEASUREMENT_FUNCTION_TAG_NAME = "agent_framework.function.name"
     MEASUREMENT_FUNCTION_INVOCATION_DURATION = "agent_framework.function.invocation.duration"
     AGENT_FRAMEWORK_GEN_AI_SYSTEM = "microsoft.agent_framework"
+    PROCESS_CPU_UTILIZATION_USER = "process.cpu.utilization.user"
+    PROCESS_CPU_UTILIZATION_SYSTEM = "process.cpu.utilization.system"
+    PROCESS_MEMORY_USAGE = "process.memory.usage"
 
     def __repr__(self) -> str:
         """Return the string representation of the enum member."""
@@ -387,6 +400,247 @@ USAGE_DETAIL_TO_OTEL_ATTR: Final[tuple[tuple[str, OtelAttr], ...]] = (
 
 
 # region Telemetry utils
+
+
+class _ProcessMetricsCapture:
+    """Per-span capture of process CPU/memory deltas.
+
+    Snapshots ``psutil.Process.cpu_times()`` and a monotonic timestamp at
+    construction; :meth:`stamp` reads them again and writes per-mode
+    utilization ratios in ``[0, 1]`` (``user``/``system``) plus RSS bytes
+    onto the span. Each capture instance is bound to one span so the
+    reported values reflect exactly that span's wall-clock lifetime --
+    there is no cross-span shared state.
+    """
+
+    __slots__ = (
+        "_armed",
+        "_ncpu",
+        "_process",
+        "_span",
+        "_start_system",
+        "_start_t",
+        "_start_user",
+    )
+
+    def __init__(self, span: trace.Span) -> None:
+        self._span: trace.Span | None = span
+        self._process: Any | None = None
+        self._ncpu: int = 1
+        self._start_t: float = 0.0
+        self._start_user: float = 0.0
+        self._start_system: float = 0.0
+        self._armed: bool = False
+        if psutil is None:
+            logger.debug("Process metrics capture disabled: psutil is not installed.")
+            return
+        try:
+            self._process = psutil.Process()
+            self._ncpu = max(int(psutil.cpu_count(logical=True) or 1), 1)
+            times = self._process.cpu_times()
+            self._start_user = float(times.user)
+            self._start_system = float(times.system)
+            self._start_t = time.monotonic()
+            self._armed = True
+        except Exception as exc:
+            logger.debug("Process metrics capture failed to snapshot baseline: %s", exc)
+
+    def is_armed(self) -> bool:
+        """Return ``True`` iff the capture successfully snapshotted a baseline."""
+        return self._armed
+
+    def stamp(self) -> None:
+        """Stamp process CPU (user/system) and memory attributes on the bound span."""
+        if not self._armed or self._span is None or self._process is None:
+            return
+        try:
+            elapsed = max(time.monotonic() - self._start_t, 1e-6)
+            times = self._process.cpu_times()
+            user_delta = max(float(times.user) - self._start_user, 0.0)
+            system_delta = max(float(times.system) - self._start_system, 0.0)
+            denom = elapsed * self._ncpu
+            self._span.set_attribute(OtelAttr.PROCESS_CPU_UTILIZATION_USER, user_delta / denom)
+            self._span.set_attribute(OtelAttr.PROCESS_CPU_UTILIZATION_SYSTEM, system_delta / denom)
+        except Exception as exc:
+            logger.debug("Process metrics capture failed to stamp CPU utilization: %s", exc)
+        try:
+            self._span.set_attribute(OtelAttr.PROCESS_MEMORY_USAGE, int(self._process.memory_info().rss))
+        except Exception as exc:
+            logger.debug("Process metrics capture failed to stamp memory usage: %s", exc)
+
+
+class _NoopProcessMetricsCapture:
+    """Inert capture returned when process metrics are disabled or already armed."""
+
+    __slots__ = ()
+
+    def stamp(self) -> None: ...
+
+    def is_armed(self) -> bool:
+        return False
+
+
+_NOOP_PROCESS_METRICS_CAPTURE: Final[_NoopProcessMetricsCapture] = _NoopProcessMetricsCapture()
+
+# Process metrics SpanProcessor (covers spans created outside of `_get_span`,
+# e.g. hosted runtimes that build their own `invoke_agent` request spans).
+
+_PROCESS_METRICS_INSTALLED_FLAG = "_agent_framework_process_metrics_installed"
+_PROCESS_METRICS_ARMED_MARKER = "_af_process_metrics_armed"
+_process_metrics_enabled: bool = False
+_process_metrics_set_provider_patched = False
+
+
+def start_process_metrics_capture(span: trace.Span) -> _ProcessMetricsCapture | _NoopProcessMetricsCapture:
+    """Start a per-span process-metrics capture.
+
+    Returns a no-op handle unless :func:`enable_process_metrics` has been called
+    (directly or via :func:`configure_otel_providers` with the corresponding
+    setting enabled). Also returns a no-op handle if the global SpanProcessor
+    installed by :func:`enable_process_metrics` has already armed a capture for
+    this span -- in that case the processor stamps the attributes at
+    ``span.end`` and the inline call would only duplicate the work.
+
+    Otherwise snapshots a ``psutil`` baseline immediately; call ``.stamp()`` on
+    the returned handle just before the span ends to record per-span CPU
+    utilization and memory usage attributes. Safe to call without ``psutil``
+    installed -- the returned handle's ``stamp()`` will be a no-op.
+    """
+    if not _process_metrics_enabled:
+        return _NOOP_PROCESS_METRICS_CAPTURE
+    if getattr(span, _PROCESS_METRICS_ARMED_MARKER, False):
+        return _NOOP_PROCESS_METRICS_CAPTURE
+    return _ProcessMetricsCapture(span)
+
+
+def _is_process_metrics_target_span(span: Any) -> bool:
+    name = getattr(span, "name", "") or ""
+    return name.startswith(OtelAttr.AGENT_INVOKE_OPERATION.value) or name.startswith(
+        OtelAttr.TOOL_EXECUTION_OPERATION.value
+    )
+
+
+def _install_process_metrics_processor_on_global_provider() -> None:
+    """Install the process-metrics SpanProcessor on the current global TracerProvider, if possible."""
+    try:
+        from opentelemetry.sdk.trace import SpanProcessor
+    except ModuleNotFoundError:
+        logger.debug("Process metrics processor not installed: opentelemetry-sdk is not available.")
+        return
+    if psutil is None:
+        logger.debug("Process metrics processor not installed: psutil is not installed.")
+        return
+
+    provider = trace.get_tracer_provider()
+    add_processor = getattr(provider, "add_span_processor", None)
+    if add_processor is None:
+        logger.debug("Process metrics processor not installed: TracerProvider has no add_span_processor.")
+        return
+    if getattr(provider, _PROCESS_METRICS_INSTALLED_FLAG, False):
+        return
+
+    class _ProcessMetricsSpanProcessor(SpanProcessor):  # type: ignore[misc]
+        def on_start(self, span: Any, parent_context: Any = None) -> None:
+            if not _is_process_metrics_target_span(span):
+                return
+            # Snapshot a per-span baseline now, then patch ``span.end`` so the
+            # deltas are stamped against that baseline just before the span is
+            # finalized. This gives per-span attribution: the reported CPU/memory
+            # is exactly what was consumed during the span's wall-clock lifetime,
+            # not what happened between two unrelated stamp sites.
+            capture = _ProcessMetricsCapture(span)
+            if not capture.is_armed():
+                return
+            # Marker tells the inline `start_process_metrics_capture()` callers
+            # (in `_get_span`, the streaming-span helper and `_tools.py`) that
+            # this span is already being tracked, so they skip and avoid a
+            # second baseline+stamp on the same span.
+            try:
+                setattr(span, _PROCESS_METRICS_ARMED_MARKER, True)
+            except Exception as exc:
+                logger.debug("Process metrics processor could not mark span as armed: %s", exc)
+            original_end = span.end
+
+            def _wrapped_end(end_time: Any = None) -> Any:
+                try:
+                    capture.stamp()
+                except Exception as exc:
+                    logger.debug("Process metrics processor failed to stamp span on end: %s", exc)
+                return original_end(end_time)
+
+            try:
+                span.end = _wrapped_end  # type: ignore[method-assign]
+            except Exception:
+                captures = getattr(self, "_captures", None)
+                if captures is None:
+                    captures = {}
+                    setattr(self, "_captures", captures)
+                captures[id(span)] = capture
+
+        def on_end(self, span: Any) -> None:
+            captures = getattr(self, "_captures", None)
+            if not captures:
+                return
+            capture = captures.pop(id(span), None)
+            if capture is not None:
+                with contextlib.suppress(Exception):
+                    capture.stamp()
+
+        def shutdown(self) -> None: ...
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            return True
+
+    add_processor(_ProcessMetricsSpanProcessor())
+    setattr(provider, _PROCESS_METRICS_INSTALLED_FLAG, True)
+    logger.debug("Process metrics SpanProcessor installed on global TracerProvider.")
+
+
+def _patch_set_tracer_provider_for_process_metrics() -> None:
+    """Re-attach the process-metrics processor whenever the global TracerProvider is replaced."""
+    global _process_metrics_set_provider_patched
+    if _process_metrics_set_provider_patched:
+        return
+    original_set = trace.set_tracer_provider
+
+    def _patched(provider: Any, *args: Any, **kwargs: Any) -> None:
+        original_set(provider, *args, **kwargs)
+        _install_process_metrics_processor_on_global_provider()
+
+    trace.set_tracer_provider = _patched  # type: ignore[assignment]
+    _process_metrics_set_provider_patched = True
+
+
+def enable_process_metrics() -> None:
+    """Stamp process CPU utilization and memory usage on agent and tool spans across all layers.
+
+    Adds a :class:`opentelemetry.sdk.trace.SpanProcessor` to the global ``TracerProvider``
+    that records ``process.cpu.utilization.user``, ``process.cpu.utilization.system`` and
+    ``process.memory.usage`` on every span whose name starts with ``invoke_agent`` or
+    ``execute_tool``, regardless of which component created the span. Also patches
+    :func:`opentelemetry.trace.set_tracer_provider` so the processor is re-attached when a
+    downstream layer (e.g. hosted runtimes) replaces the global ``TracerProvider`` after
+    this call.
+
+    This is invoked automatically by :func:`configure_otel_providers`, so most users do
+    not need to call it explicitly; it remains exposed for applications that configure
+    their own ``TracerProvider`` (e.g. via ``azure-monitor-opentelemetry``). Safe to call
+    multiple times; subsequent calls are no-ops. Requires the optional ``psutil`` and
+    ``opentelemetry-sdk`` packages; if either is unavailable, this is a no-op.
+
+    Also flips the module-level enable flag, which is the single switch that gates the
+    inline ``start_process_metrics_capture()`` callers in the framework. Until this
+    function is called, those inline callers return an inert handle and do not touch
+    ``psutil``.
+    """
+    global _process_metrics_enabled
+    if psutil is None:
+        logger.debug("enable_process_metrics() is a no-op: psutil is not installed.")
+        return
+    _process_metrics_enabled = True
+    _install_process_metrics_processor_on_global_provider()
+    _patch_set_tracer_provider_for_process_metrics()
+    logger.debug("Process metrics enabled: CPU/memory attributes will be stamped on invoke_agent/execute_tool spans.")
 
 
 # Parse headers helper
@@ -721,6 +975,7 @@ class _ObservabilitySettingsData(TypedDict, total=False):
     enable_instrumentation: bool | None
     enable_sensitive_data: bool | None
     enable_console_exporters: bool | None
+    enable_process_metrics: bool | None
     vs_code_extension_port: int | None
 
 
@@ -754,6 +1009,10 @@ class ObservabilitySettings:
             Can be set via environment variable ENABLE_SENSITIVE_DATA.
         enable_console_exporters: Enable console exporters for traces, logs, and metrics.
             Default is False. Can be set via environment variable ENABLE_CONSOLE_EXPORTERS.
+        enable_process_metrics: Stamp ``process.cpu.utilization.{user,system}`` and
+            ``process.memory.usage`` attributes on agent and tool spans. Default is False.
+            Can be set via environment variable ENABLE_PROCESS_METRICS. Requires the optional
+            ``psutil`` package; if it is unavailable this flag is a no-op.
         vs_code_extension_port: The port the AI Toolkit or Microsoft Foundry VS Code extensions are listening on.
             Default is None.
             Can be set via environment variable VS_CODE_EXTENSION_PORT.
@@ -800,6 +1059,7 @@ class ObservabilitySettings:
             )
 
         self.enable_console_exporters: bool = data.get("enable_console_exporters") or False
+        self.enable_process_metrics: bool = data.get("enable_process_metrics") or False
         self.vs_code_extension_port: int | None = data.get("vs_code_extension_port")
         self.env_file_path = env_file_path
         self.env_file_encoding = env_file_encoding
@@ -1010,6 +1270,13 @@ class ObservabilitySettings:
                 views=views or [],
             )
             metrics.set_meter_provider(meter_provider)
+
+        # Process metrics attach to the *global* TracerProvider and patch
+        # `set_tracer_provider`, so they work whether tracing was configured above
+        # or by an external integration (e.g. azure-monitor-opentelemetry). Enable
+        # them last so the global provider is whatever the caller ultimately wants.
+        if self.enable_process_metrics:
+            enable_process_metrics()
 
 
 def get_tracer(
@@ -1234,6 +1501,7 @@ def configure_otel_providers(
     *,
     enable_sensitive_data: bool | None = None,
     enable_console_exporters: bool | None = None,
+    enable_process_metrics: bool | None = None,
     exporters: list[LogRecordExporter | SpanExporter | MetricExporter] | None = None,
     views: list[View] | None = None,
     vs_code_extension_port: int | None = None,
@@ -1274,6 +1542,12 @@ def configure_otel_providers(
             the environment variable ENABLE_SENSITIVE_DATA if set. Default is None.
         enable_console_exporters: Enable console exporters for traces, logs, and metrics.
             Overrides the environment variable ENABLE_CONSOLE_EXPORTERS if set. Default is None.
+        enable_process_metrics: Stamp ``process.cpu.utilization.{user,system}`` and
+            ``process.memory.usage`` attributes on agent (``invoke_agent``) and tool
+            (``execute_tool``) spans, including spans created by externally configured
+            providers (e.g. ``azure-monitor-opentelemetry``). Overrides the environment
+            variable ENABLE_PROCESS_METRICS if set. Requires the optional ``psutil``
+            package; if it is unavailable this flag is a no-op. Default is None.
         exporters: A list of custom exporters for logs, metrics or spans, or any combination.
             These will be added in addition to exporters configured via environment variables.
             Default is None.
@@ -1370,6 +1644,8 @@ def configure_otel_providers(
             settings_kwargs["enable_sensitive_data"] = enable_sensitive_data
         if enable_console_exporters is not None:
             settings_kwargs["enable_console_exporters"] = enable_console_exporters
+        if enable_process_metrics is not None:
+            settings_kwargs["enable_process_metrics"] = enable_process_metrics
         if vs_code_extension_port is not None:
             settings_kwargs["vs_code_extension_port"] = vs_code_extension_port
 
@@ -1377,6 +1653,7 @@ def configure_otel_providers(
         OBSERVABILITY_SETTINGS.enable_instrumentation = updated_settings.enable_instrumentation
         OBSERVABILITY_SETTINGS.enable_sensitive_data = updated_settings.enable_sensitive_data
         OBSERVABILITY_SETTINGS.enable_console_exporters = updated_settings.enable_console_exporters
+        OBSERVABILITY_SETTINGS.enable_process_metrics = updated_settings.enable_process_metrics
         OBSERVABILITY_SETTINGS.vs_code_extension_port = updated_settings.vs_code_extension_port
         OBSERVABILITY_SETTINGS.env_file_path = updated_settings.env_file_path
         OBSERVABILITY_SETTINGS.env_file_encoding = updated_settings.env_file_encoding
@@ -1392,6 +1669,9 @@ def configure_otel_providers(
             enable_console_exporters
             if enable_console_exporters is not None
             else _read_bool_env("ENABLE_CONSOLE_EXPORTERS")
+        )
+        OBSERVABILITY_SETTINGS.enable_process_metrics = (
+            enable_process_metrics if enable_process_metrics is not None else _read_bool_env("ENABLE_PROCESS_METRICS")
         )
         OBSERVABILITY_SETTINGS.vs_code_extension_port = (
             vs_code_extension_port if vs_code_extension_port is not None else _read_int_env("VS_CODE_EXTENSION_PORT")
@@ -1881,6 +2161,9 @@ class AgentTelemetryLayer:
             inner_response_telemetry_captured_fields_token: contextvars.Token[set[str] | None] | None = None
             inner_accumulated_usage_token: contextvars.Token[UsageDetails | None] | None = None
             span = _start_streaming_span(attributes, OtelAttr.AGENT_NAME)
+            # Snapshot the per-span baseline at stream start so the stamp at
+            # span close reflects exactly the streaming span's lifetime.
+            process_metrics = start_process_metrics_capture(span)
 
             if OBSERVABILITY_SETTINGS.SENSITIVE_DATA_ENABLED and messages and span.is_recording():
                 _capture_messages(
@@ -1898,6 +2181,7 @@ class AgentTelemetryLayer:
                 if span_state["closed"]:
                     return
                 span_state["closed"] = True
+                process_metrics.stamp()
                 span.end()
 
             def _record_duration() -> None:
@@ -2303,15 +2587,23 @@ def _get_span(
     """
     operation = attributes.get(OtelAttr.OPERATION, "operation")
     span_name = attributes.get(span_name_attribute, "unknown")
+    capture_process_metrics = operation in (OtelAttr.AGENT_INVOKE_OPERATION, OtelAttr.TOOL_EXECUTION_OPERATION)
     span = get_tracer().start_span(f"{operation} {span_name}")
     span.set_attributes(attributes)
+    # Snapshot the per-span baseline immediately so the stamp at span end
+    # reflects exactly this span's wall-clock lifetime.
+    process_metrics = start_process_metrics_capture(span) if capture_process_metrics else None
     with trace.use_span(
         span=span,
         end_on_exit=True,
         record_exception=False,
         set_status_on_exception=False,
     ) as current_span:
-        yield current_span
+        try:
+            yield current_span
+        finally:
+            if process_metrics is not None:
+                process_metrics.stamp()
 
 
 def _start_streaming_span(attributes: dict[str, Any], span_name_attribute: str) -> trace.Span:
